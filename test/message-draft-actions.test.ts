@@ -1,4 +1,7 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Command } from "commander";
 import type { CliContext } from "../src/cli/context.ts";
 import {
@@ -21,8 +24,15 @@ function createContext(
   fixtures: {
     draftsList?: Record<string, unknown>[];
     channelInfo?: Record<string, Record<string, unknown>>;
+    /** First call to this method returns ok:false invalid_auth (for retry tests). */
+    failOnce?: "drafts.create" | "drafts.update";
+    /** Every call to this method returns ok:false with the given error. */
+    failWith?: { method: "drafts.create" | "drafts.update"; error: string };
+    /** Simulate withAutoRefresh retrying work once on an invalid_auth error. */
+    retryOnAuth?: boolean;
   } = {},
 ) {
+  const failedOnce = { current: false };
   const client = {
     api: async (method: string, params: Record<string, unknown> = {}) => {
       calls.push({ method, params });
@@ -30,12 +40,24 @@ function createContext(
         case "drafts.list":
           return { ok: true, drafts: fixtures.draftsList ?? [] };
         case "drafts.create":
-          return { ok: true, draft: { id: "DrNew", destinations: params.destinations } };
-        case "drafts.update":
-          return {
-            ok: true,
-            draft: { id: String(params.draft_id), destinations: params.destinations },
-          };
+        case "drafts.update": {
+          // Simulate a transient auth failure on the first call to this method,
+          // then succeed on retry — exercises withAutoRefresh's work() re-run.
+          if (fixtures.failOnce === method && !failedOnce.current) {
+            failedOnce.current = true;
+            return { ok: false, error: "invalid_auth" };
+          }
+          // Simulate a persistent failure (e.g. stale conflict) on every call.
+          if (fixtures.failWith?.method === method) {
+            return { ok: false, error: fixtures.failWith.error };
+          }
+          return method === "drafts.create"
+            ? { ok: true, draft: { id: "DrNew", destinations: params.destinations } }
+            : {
+                ok: true,
+                draft: { id: String(params.draft_id), destinations: params.destinations },
+              };
+        }
         case "drafts.delete":
           return { ok: true };
         case "conversations.open":
@@ -43,6 +65,13 @@ function createContext(
         case "conversations.info": {
           const info = fixtures.channelInfo?.[String(params.channel)];
           return info ? { ok: true, channel: info } : { ok: true };
+        }
+        case "files.getUploadURLExternal":
+          // file_id derived from filename so multi-file uploads stay distinct.
+          return { ok: true, upload_url: "https://upload.example/f", file_id: `F-${params.filename}` };
+        case "files.completeUploadExternal": {
+          const files = (params.files as { id?: unknown }[] | undefined) ?? [];
+          return { ok: true, files: files.map((f) => ({ id: String(f?.id ?? "F?"), title: "t" })) };
         }
         default:
           return { ok: true };
@@ -56,7 +85,21 @@ function createContext(
     withAutoRefresh: async <T>(input: {
       workspaceUrl: string | undefined;
       work: () => Promise<T>;
-    }) => input.work(),
+    }) => {
+      // Mirror the real helper: retry work() once when it throws an auth error.
+      if (!fixtures.retryOnAuth) {
+        return input.work();
+      }
+      try {
+        return await input.work();
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/(?:^|[^a-z])(invalid_auth|token_expired)(?:$|[^a-z])/i.test(message)) {
+          return await input.work();
+        }
+        throw err;
+      }
+    },
     getClientForWorkspace: async () => ({
       client: client as never,
       auth: { auth_type: "standard", token: "x" as const },
@@ -193,6 +236,61 @@ describe("createDraftAction", () => {
       }),
     ).rejects.toThrow(/not supported for DM targets/);
     expect(calls.length).toBe(0);
+  });
+
+  test("uploads --attach files and wires their file ids into the draft", async () => {
+    const calls: Call[] = [];
+    const ctx = createContext(calls);
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-create-attach-"));
+    const a = join(dir, "a.png");
+    const b = join(dir, "b.pdf");
+    await writeFile(a, "x");
+    await writeFile(b, "y");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () => new Response("", { status: 200 })) as unknown as typeof fetch;
+
+    try {
+      await createDraftAction({
+        ctx,
+        targetInput: "C11111111",
+        text: "see attached",
+        options: { workspace: "https://workspace.slack.com", attach: [a, b] },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    const methods = calls.map((c) => c.method);
+    // Batch upload: stage every file first, then one completion call, then the draft.
+    expect(methods).toEqual([
+      "files.getUploadURLExternal",
+      "files.getUploadURLExternal",
+      "files.completeUploadExternal",
+      "drafts.create",
+    ]);
+    expect(calls.filter((c) => c.method === "files.completeUploadExternal")).toHaveLength(1);
+    const create = calls.at(-1)!;
+    expect(create.params.file_ids).toEqual(["F-a.png", "F-b.pdf"]);
+  });
+
+  test("aborts before any upload or drafts.create when an --attach path is missing", async () => {
+    const calls: Call[] = [];
+    const ctx = createContext(calls);
+
+    await expect(
+      createDraftAction({
+        ctx,
+        targetInput: "C11111111",
+        text: "nope",
+        options: {
+          workspace: "https://workspace.slack.com",
+          attach: [join(tmpdir(), "agent-slack-nonexistent-attach.png")],
+        },
+      }),
+    ).rejects.toThrow();
+    expect(calls.some((c) => c.method === "drafts.create")).toBe(false);
+    expect(calls.some((c) => c.method === "files.getUploadURLExternal")).toBe(false);
   });
 });
 
@@ -447,6 +545,60 @@ describe("updateDraftAction", () => {
     // findDraft (drafts.list) runs, but no channel-name resolution round-trip.
     expect(calls.some((c) => c.method === "search.messages")).toBe(false);
   });
+
+  test("merges --attach file ids into the draft's existing file_ids", async () => {
+    const calls: Call[] = [];
+    const ctx = createContext(calls, { draftsList: [threadedBroadcastDraft] });
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-update-attach-"));
+    const c = join(dir, "c.txt");
+    await writeFile(c, "z");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () => new Response("", { status: 200 })) as unknown as typeof fetch;
+
+    try {
+      await updateDraftAction({
+        ctx,
+        draftId: "Dr123",
+        text: "revised",
+        options: { workspace: "https://workspace.slack.com", attach: [c] },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    const update = draftsUpdateCall(calls);
+    // threadedBroadcastDraft.file_ids is ["F1", "F2"]; the new file id is
+    // appended without dropping the preserved ones.
+    expect(update.params.file_ids).toEqual(["F1", "F2", "F-c.txt"]);
+  });
+
+  test("merges --attach while de-duplicating ids already on the draft", async () => {
+    const calls: Call[] = [];
+    const draftWithDupFile = { ...threadedBroadcastDraft, file_ids: ["F-c.txt"] };
+    const ctx = createContext(calls, { draftsList: [draftWithDupFile] });
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-update-dedup-"));
+    const c = join(dir, "c.txt");
+    await writeFile(c, "z");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () => new Response("", { status: 200 })) as unknown as typeof fetch;
+
+    try {
+      await updateDraftAction({
+        ctx,
+        draftId: "Dr123",
+        text: "revised",
+        options: { workspace: "https://workspace.slack.com", attach: [c] },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    // The newly uploaded id (F-c.txt) collides with the draft's existing id;
+    // the merge must keep only one copy.
+    expect(draftsUpdateCall(calls).params.file_ids).toEqual(["F-c.txt"]);
+  });
 });
 
 describe("deleteDraftAction", () => {
@@ -563,6 +715,51 @@ describe("message draft update (commander --broadcast wiring)", () => {
   });
 });
 
+describe("message draft create (commander --attach wiring)", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("collects repeatable --attach flags into an array", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-cmd-attach-"));
+    const a = join(dir, "a.png");
+    const b = join(dir, "b.pdf");
+    await writeFile(a, "x");
+    await writeFile(b, "y");
+    globalThis.fetch = mock(async () => new Response("", { status: 200 })) as unknown as typeof fetch;
+
+    const calls: Call[] = [];
+    const program = new Command();
+    program.exitOverride();
+    const messageCmd = program.command("message");
+    registerMessageDraftCommand({ ctx: createContext(calls), messageCmd });
+
+    try {
+      await program.parseAsync([
+        "node",
+        "agent-slack",
+        "message",
+        "draft",
+        "create",
+        "C11111111",
+        "hi",
+        "--workspace",
+        "https://workspace.slack.com",
+        "--attach",
+        a,
+        "--attach",
+        b,
+      ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    const create = calls.find((c) => c.method === "drafts.create");
+    expect(create?.params.file_ids).toEqual(["F-a.png", "F-b.pdf"]);
+  });
+});
+
 describe("message draft unknown subcommand", () => {
   test("old `message draft <target>` usage points to `message compose`", () => {
     const errors: string[] = [];
@@ -585,5 +782,157 @@ describe("message draft unknown subcommand", () => {
     expect(process.exitCode).toBe(1);
     // Don't leak a failing exit code into the test runner.
     process.exitCode = prevExit;
+  });
+});
+
+describe("draft attachments: orphan prevention across auth-retry and failed drafts", () => {
+  const originalFetch = globalThis.fetch;
+  beforeEach(() => {
+    globalThis.fetch = mock(async () => new Response("", { status: 200 })) as unknown as typeof fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("#2 create: a drafts.create auth failure retries work WITHOUT re-uploading files", async () => {
+    const calls: Call[] = [];
+    const ctx = createContext(calls, { failOnce: "drafts.create", retryOnAuth: true });
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-retry-create-"));
+    const a = join(dir, "a.png");
+    await writeFile(a, "x");
+    try {
+      await createDraftAction({
+        ctx,
+        targetInput: "C11111111",
+        text: "see attached",
+        options: { workspace: "https://workspace.slack.com", attach: [a] },
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    // The upload ran exactly once: one stage + one completion. The retried
+    // work() reused the already-uploaded file id instead of uploading again.
+    expect(calls.filter((c) => c.method === "files.getUploadURLExternal")).toHaveLength(1);
+    expect(calls.filter((c) => c.method === "files.completeUploadExternal")).toHaveLength(1);
+    // drafts.create ran twice (first failed auth, second succeeded), both
+    // carrying the same single file id.
+    const creates = calls.filter((c) => c.method === "drafts.create");
+    expect(creates).toHaveLength(2);
+    expect(creates.every((c) => (c.params.file_ids as string[]).join(",") === "F-a.png")).toBe(true);
+    // No cleanup needed: the retry succeeded and bound the file.
+    expect(calls.some((c) => c.method === "files.delete")).toBe(false);
+  });
+
+  test("#2 update: a drafts.update auth failure retries work WITHOUT re-uploading files", async () => {
+    const calls: Call[] = [];
+    const existing = {
+      id: "Dr123",
+      blocks: [],
+      destinations: [{ channel_id: "C11111111", thread_ts: "1700000000.100000" }],
+      last_updated_ts: "1700000000.5",
+      file_ids: ["F1"],
+    };
+    const ctx = createContext(calls, { draftsList: [existing], failOnce: "drafts.update", retryOnAuth: true });
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-retry-update-"));
+    const c = join(dir, "c.txt");
+    await writeFile(c, "z");
+    try {
+      await updateDraftAction({
+        ctx,
+        draftId: "Dr123",
+        text: "revised",
+        options: { workspace: "https://workspace.slack.com", attach: [c] },
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    // Only one upload round (new file staged + completed once) despite the retry.
+    expect(calls.filter((c) => c.method === "files.getUploadURLExternal")).toHaveLength(1);
+    expect(calls.filter((c) => c.method === "files.completeUploadExternal")).toHaveLength(1);
+    // drafts.update ran twice, both merging the preserved id with the reused new id.
+    const updates = calls.filter((c) => c.method === "drafts.update");
+    expect(updates).toHaveLength(2);
+    expect(updates.every((c) => (c.params.file_ids as string[]).join(",") === "F1,F-c.txt")).toBe(true);
+    expect(calls.some((c) => c.method === "files.delete")).toBe(false);
+  });
+
+  test("#3 create: a non-auth drafts.create failure deletes the uploaded file", async () => {
+    const calls: Call[] = [];
+    const ctx = createContext(calls, { failWith: { method: "drafts.create", error: "denied" } });
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-fail-create-"));
+    const a = join(dir, "a.png");
+    await writeFile(a, "x");
+
+    try {
+      await expect(
+        createDraftAction({
+          ctx,
+          targetInput: "C11111111",
+          text: "see attached",
+          options: { workspace: "https://workspace.slack.com", attach: [a] },
+        }),
+      ).rejects.toThrow(/drafts.create failed/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    // The uploaded file was cleaned up so it doesn't sit orphaned/private.
+    const deletes = calls.filter((c) => c.method === "files.delete");
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]?.params.file).toBe("F-a.png");
+  });
+
+  test("#3 update: a stale drafts.update failure deletes the newly uploaded file only", async () => {
+    const calls: Call[] = [];
+    const existing = {
+      id: "Dr123",
+      blocks: [],
+      destinations: [{ channel_id: "C11111111", thread_ts: "1700000000.100000" }],
+      last_updated_ts: "1700000000.5",
+      file_ids: ["F1"],
+    };
+    const ctx = createContext(calls, {
+      draftsList: [existing],
+      failWith: { method: "drafts.update", error: "stale" },
+    });
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-draft-fail-update-"));
+    const c = join(dir, "c.txt");
+    await writeFile(c, "z");
+
+    try {
+      await expect(
+        updateDraftAction({
+          ctx,
+          draftId: "Dr123",
+          text: "revised",
+          options: { workspace: "https://workspace.slack.com", attach: [c] },
+        }),
+      ).rejects.toThrow(/drafts.update failed/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    // Only the newly uploaded file is cleaned up; the draft's preserved F1 is untouched.
+    const deletes = calls.filter((c) => c.method === "files.delete");
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]?.params.file).toBe("F-c.txt");
+  });
+
+  test("a failed draft with no attachments does not attempt files.delete", async () => {
+    const calls: Call[] = [];
+    const ctx = createContext(calls, { failWith: { method: "drafts.create", error: "denied" } });
+
+    await expect(
+      createDraftAction({
+        ctx,
+        targetInput: "C11111111",
+        text: "no file",
+        options: { workspace: "https://workspace.slack.com" },
+      }),
+    ).rejects.toThrow(/drafts.create failed/);
+
+    expect(calls.some((c) => c.method === "files.delete")).toBe(false);
   });
 });

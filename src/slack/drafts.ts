@@ -159,6 +159,21 @@ function buildDraftBody(input: {
   };
 }
 
+/**
+ * Guard a drafts.create / drafts.update response: Slack returns ok:false (with
+ * `error`, e.g. invalid_auth or a stale client_last_updated_ts conflict) when
+ * the call fails. Without this the caller would silently treat a failure as
+ * "no draft", and any files uploaded just before the call would be left
+ * orphaned. The thrown message preserves the Slack error verbatim so the auth
+ * retry wrapper can still match `invalid_auth` / `token_expired`.
+ */
+function ensureDraftOk(method: string, resp: unknown): void {
+  if (!isRecord(resp) || resp.ok === false) {
+    const errMsg = isRecord(resp) && typeof resp.error === "string" ? resp.error : "unknown";
+    throw new Error(`Slack ${method} failed: ${errMsg}`);
+  }
+}
+
 export async function createDraft(
   client: SlackApiClient,
   input: {
@@ -166,6 +181,7 @@ export async function createDraft(
     text: string;
     threadTs?: string;
     broadcast?: boolean;
+    fileIds?: string[];
   },
 ): Promise<SlackDraft | null> {
   const resp = await client.api("drafts.create", {
@@ -173,6 +189,7 @@ export async function createDraft(
     // Sent on create only, matching the official client's behavior.
     is_from_composer: true,
   });
+  ensureDraftOk("drafts.create", resp);
   return parseDraftRecord(resp.draft);
 }
 
@@ -193,6 +210,7 @@ export async function updateDraft(
     draft_id: input.draftId,
     client_last_updated_ts: padDraftTs(input.clientLastUpdatedTs),
   });
+  ensureDraftOk("drafts.update", resp);
   return parseDraftRecord(resp.draft);
 }
 

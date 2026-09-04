@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Command } from "commander";
 import type { CliContext } from "../src/cli/context.ts";
 import { readCanvasMarkdownInput, registerCanvasCommand } from "../src/cli/canvas-command.ts";
-import { createCanvasFromMarkdown } from "../src/slack/canvas.ts";
+import { createCanvasFromMarkdown, editCanvas } from "../src/slack/canvas.ts";
 import type { SlackApiClient, SlackAuth } from "../src/slack/client.ts";
 
 function createClient(response: Record<string, unknown> = { ok: true, canvas_id: "F12345678" }) {
@@ -167,6 +167,158 @@ describe("createCanvasFromMarkdown", () => {
   });
 });
 
+describe("editCanvas", () => {
+  test.each([
+    [
+      "replace",
+      undefined,
+      { operation: "replace", document_content: { type: "markdown", markdown: "# Revised\n" } },
+    ],
+    [
+      "replace section",
+      "temp:C:SECTION",
+      {
+        operation: "replace",
+        section_id: "temp:C:SECTION",
+        document_content: { type: "markdown", markdown: "Updated section" },
+      },
+    ],
+    [
+      "insert before",
+      "temp:C:SECTION",
+      {
+        operation: "insert_before",
+        section_id: "temp:C:SECTION",
+        document_content: { type: "markdown", markdown: "Before" },
+      },
+    ],
+    [
+      "insert after",
+      "temp:C:SECTION",
+      {
+        operation: "insert_after",
+        section_id: "temp:C:SECTION",
+        document_content: { type: "markdown", markdown: "After" },
+      },
+    ],
+    [
+      "insert at start",
+      undefined,
+      {
+        operation: "insert_at_start",
+        document_content: { type: "markdown", markdown: "Start" },
+      },
+    ],
+    [
+      "insert at end",
+      undefined,
+      {
+        operation: "insert_at_end",
+        document_content: { type: "markdown", markdown: "End" },
+      },
+    ],
+    ["delete section", "temp:C:SECTION", { operation: "delete", section_id: "temp:C:SECTION" }],
+    [
+      "rename",
+      undefined,
+      {
+        operation: "rename",
+        title_content: { type: "markdown", markdown: "Project status" },
+      },
+    ],
+  ] as const)("sends the documented %s change", async (_name, sectionId, expectedChange) => {
+    const { client, calls } = createClient({ ok: true });
+    const { operation } = expectedChange;
+    const markdown =
+      "document_content" in expectedChange ? expectedChange.document_content.markdown : undefined;
+    const title =
+      "title_content" in expectedChange ? expectedChange.title_content.markdown : undefined;
+    const result = await editCanvas(client, {
+      canvasId: " F12345678 ",
+      operation,
+      markdown,
+      title,
+      sectionId,
+    });
+
+    expect(calls).toEqual([
+      {
+        transport: "json",
+        method: "canvases.edit",
+        params: { canvas_id: "F12345678", changes: [expectedChange] },
+      },
+    ]);
+    expect(result).toEqual({ ok: true, canvas: { id: "F12345678", operation } });
+  });
+
+  test("rejects invalid combinations before calling Slack", async () => {
+    const cases = [
+      {
+        input: { operation: "insert_after", markdown: "Body" },
+        message: 'operation "insert_after" requires --section-id',
+      },
+      {
+        input: { operation: "insert_at_end", markdown: "Body", sectionId: "temp:C:SECTION" },
+        message: 'operation "insert_at_end" cannot use --section-id',
+      },
+      {
+        input: { operation: "delete" },
+        message: 'operation "delete" requires --section-id',
+      },
+      {
+        input: { operation: "rename" },
+        message: 'operation "rename" requires a non-empty --title',
+      },
+      {
+        input: { operation: "replace", markdown: "Body", title: "Wrong" },
+        message: "--title is only valid with the rename operation",
+      },
+      {
+        input: { operation: "nope", markdown: "Body" },
+        message: 'Unsupported canvas edit operation "nope"',
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const { client, calls } = createClient({ ok: true });
+      await expect(
+        editCanvas(client, { canvasId: "F12345678", ...testCase.input }),
+      ).rejects.toThrow(testCase.message);
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  test("rejects empty Markdown and canvas ids before calling Slack", async () => {
+    const { client, calls } = createClient({ ok: true });
+    await expect(
+      editCanvas(client, { canvasId: "F12345678", operation: "replace", markdown: " \n" }),
+    ).rejects.toThrow("requires non-empty Markdown");
+    await expect(
+      editCanvas(client, { canvasId: " ", operation: "delete", sectionId: "temp:C:SECTION" }),
+    ).rejects.toThrow("Canvas id is required");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects Markdown over Slack's per-change limit before calling Slack", async () => {
+    const { client, calls } = createClient({ ok: true });
+    await expect(
+      editCanvas(client, {
+        canvasId: "F12345678",
+        operation: "replace",
+        markdown: "x".repeat(1_048_577),
+      }),
+    ).rejects.toThrow("character limit");
+    await expect(
+      editCanvas(client, {
+        canvasId: "F12345678",
+        operation: "rename",
+        title: "x".repeat(1_048_577),
+      }),
+    ).rejects.toThrow("character limit");
+    expect(calls).toHaveLength(0);
+  });
+});
+
 describe("readCanvasMarkdownInput", () => {
   test("reads a Markdown file without changing its contents", async () => {
     const dir = await mkdtemp(join(tmpdir(), "agent-slack-canvas-"));
@@ -301,6 +453,167 @@ describe("canvas create command", () => {
     expect(error).toHaveBeenCalledTimes(2);
     expect(workspaceSelections).toHaveLength(0);
     expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+  });
+});
+
+describe("canvas edit command", () => {
+  const originalLog = console.log;
+  const originalError = console.error;
+
+  beforeEach(() => {
+    process.exitCode = 0;
+  });
+
+  afterEach(() => {
+    process.exitCode = 0;
+    console.log = originalLog;
+    console.error = originalError;
+  });
+
+  test("replaces a canvas from a Markdown URL target", async () => {
+    const { client, calls } = createClient({ ok: true });
+    const { ctx, workspaceSelections } = createContext(client);
+    const program = new Command();
+    registerCanvasCommand({ program, ctx });
+    const log = mock((_value?: unknown) => {});
+    console.log = log as typeof console.log;
+
+    await program.parseAsync(
+      ["canvas", "edit", "https://acme.slack.com/docs/T123/F12345678", "--markdown", "# Revised\n"],
+      { from: "user" },
+    );
+
+    expect(workspaceSelections).toEqual(["https://acme.slack.com"]);
+    expect(calls[0]).toEqual({
+      transport: "json",
+      method: "canvases.edit",
+      params: {
+        canvas_id: "F12345678",
+        changes: [
+          { operation: "replace", document_content: { type: "markdown", markdown: "# Revised\n" } },
+        ],
+      },
+    });
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({
+      ok: true,
+      canvas: { id: "F12345678", operation: "replace" },
+    });
+  });
+
+  test("inserts content from a file and passes a section id", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-slack-canvas-edit-command-"));
+    const path = join(dir, "addition.md");
+    try {
+      await writeFile(path, "Added\n", "utf8");
+      const { client, calls } = createClient({ ok: true });
+      const { ctx } = createContext(client);
+      const program = new Command();
+      registerCanvasCommand({ program, ctx });
+      console.log = mock(() => {}) as typeof console.log;
+
+      await program.parseAsync(
+        [
+          "canvas",
+          "edit",
+          "F12345678",
+          "--operation",
+          "insert_after",
+          "--section-id",
+          "temp:C:SECTION",
+          "--file",
+          path,
+        ],
+        { from: "user" },
+      );
+
+      expect(calls[0]?.params).toEqual({
+        canvas_id: "F12345678",
+        changes: [
+          {
+            operation: "insert_after",
+            section_id: "temp:C:SECTION",
+            document_content: { type: "markdown", markdown: "Added\n" },
+          },
+        ],
+      });
+      expect(process.exitCode).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("renames without a Markdown source", async () => {
+    const { client, calls } = createClient({ ok: true });
+    const { ctx } = createContext(client);
+    const program = new Command();
+    registerCanvasCommand({ program, ctx });
+    console.log = mock(() => {}) as typeof console.log;
+
+    await program.parseAsync(
+      ["canvas", "edit", "F12345678", "--operation", "rename", "--title", "Renamed"],
+      { from: "user" },
+    );
+
+    expect(calls[0]?.params).toEqual({
+      canvas_id: "F12345678",
+      changes: [{ operation: "rename", title_content: { type: "markdown", markdown: "Renamed" } }],
+    });
+  });
+
+  test("rejects delete content and malformed inputs before authenticating", async () => {
+    const { client, calls } = createClient({ ok: true });
+    const { ctx, workspaceSelections } = createContext(client);
+    const program = new Command();
+    registerCanvasCommand({ program, ctx });
+    const error = mock((_value?: unknown) => {});
+    console.error = error as typeof console.error;
+
+    await program.parseAsync(
+      [
+        "canvas",
+        "edit",
+        "F12345678",
+        "--operation",
+        "delete",
+        "--section-id",
+        "x",
+        "--markdown",
+        "nope",
+      ],
+      { from: "user" },
+    );
+    await program.parseAsync(
+      ["canvas", "edit", "F12345678", "--operation", "not-real", "--markdown", "nope"],
+      { from: "user" },
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(workspaceSelections).toHaveLength(0);
+    expect(error).toHaveBeenCalledTimes(2);
+    expect(String(error.mock.calls[0]?.[0])).toContain("does not accept Markdown content");
+    expect(String(error.mock.calls[1]?.[0])).toContain("Unsupported canvas edit operation");
+    expect(process.exitCode).toBe(1);
+  });
+
+  test("rejects browser credentials before calling canvases.edit", async () => {
+    const { client, calls } = createClient({ ok: true });
+    const { ctx } = createContext(client, {
+      auth_type: "browser",
+      xoxc_token: "xoxc-test",
+      xoxd_cookie: "xoxd-test",
+    });
+    const program = new Command();
+    registerCanvasCommand({ program, ctx });
+    const error = mock((_value?: unknown) => {});
+    console.error = error as typeof console.error;
+
+    await program.parseAsync(["canvas", "edit", "F12345678", "--markdown", "# Revised"], {
+      from: "user",
+    });
+
+    expect(calls).toHaveLength(0);
+    expect(String(error.mock.calls[0]?.[0])).toContain("standard Slack token");
     expect(process.exitCode).toBe(1);
   });
 });

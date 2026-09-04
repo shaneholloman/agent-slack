@@ -37,7 +37,7 @@ nix run github:stablyai/agent-slack
 - **Write**: send now or schedule delivery, edit/delete messages, add reactions (bullet lists auto-render as native Slack rich text)
 - **Compose & drafts**: open a browser editor (`message compose`), or manage Slack-native drafts that show up in your Slack client (`message draft`)
 - **Channels**: list conversations, create channels, and invite users by id/handle/email
-- **Canvas**: create Slack canvases from Markdown and fetch them as Markdown
+- **Canvas**: create, edit, and fetch Slack canvases as Markdown
 
 ## Agent skill
 
@@ -109,6 +109,7 @@ agent-slack
 │   └── run     <trigger-id>       # trip a workflow trigger
 └── canvas
     ├── create                     # markdown file/blob → canvas
+    ├── edit <canvas-url-or-id>    # replace/insert/delete/rename a canvas
     └── get <canvas-url-or-id>     # canvas → markdown
 ```
 
@@ -562,7 +563,7 @@ agent-slack later remind "https://workspace.slack.com/archives/C123/p17000000000
 
 Named reminder days such as `tomorrow` and `monday` mean 9:00 in the CLI process's local timezone. Use a Unix timestamp when timezone precision matters.
 
-### Create or fetch a Canvas as Markdown
+### Create, edit, or fetch a Canvas as Markdown
 
 ```bash
 # Create from a local Markdown file
@@ -577,12 +578,32 @@ agent-slack canvas create --file ./launch-plan.md --channel "project-launch"
 # Fetch an existing canvas as Markdown
 agent-slack canvas get "https://workspace.slack.com/docs/T123/F456"
 agent-slack canvas get "F456" --workspace "https://workspace.slack.com"
+
+# Replace the entire canvas (the default operation)
+agent-slack canvas edit "F12345678" --file ./revised-plan.md --workspace "https://workspace.slack.com"
+
+# Apply a section-level edit (look up section IDs with Slack's Canvas tools)
+agent-slack canvas edit "F12345678" --operation insert_after --section-id "temp:C:SECTION" \
+  --markdown $'## Follow-up\n\n- [ ] Verify rollout' --workspace "https://workspace.slack.com"
+
+# Delete a section or rename the canvas
+agent-slack canvas edit "F12345678" --operation delete --section-id "temp:C:SECTION" \
+  --workspace "https://workspace.slack.com"
+agent-slack canvas edit "F12345678" --operation rename --title "Launch plan (final)" \
+  --workspace "https://workspace.slack.com"
 ```
 
 `canvas create` requires exactly one of `--file <path>` or `--markdown <text>`. Use
 `--workspace <url-or-unique-substring>` to select a workspace when needed. The command returns
 `canvas: { id, title?, channel_id? }`. Imported browser credentials can create standalone
 canvases; `--channel` requires a standard Slack token with Slack's `canvases:write` scope.
+
+`canvas edit` calls Slack's `canvases.edit` method and supports one operation per call:
+`insert_after`, `insert_before`, `insert_at_start`, `insert_at_end`, `replace`, `delete`, or
+`rename`. `replace` is the default and replaces the entire canvas unless `--section-id` is
+provided. Content operations require exactly one Markdown source; `delete` requires a section ID;
+`rename` requires `--title`. Editing requires a standard token with Slack's `canvases:write` scope;
+imported browser credentials cannot edit canvases.
 
 ## Developing / Contributing
 

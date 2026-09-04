@@ -10,6 +10,7 @@ Slack data commands print JSON to stdout. Help, update, and some authentication 
 Immediate non-attachment sends return `ts` and usually a `permalink`. Attachment sends return neither; scheduled sends return `scheduled_message_id` and `post_at` instead.
 
 `canvas create` returns `canvas: { id, title?, channel_id? }`. `canvas get` returns `canvas: { id, title?, markdown }`.
+`canvas edit` returns `ok: true` and `canvas: { id, operation }` after Slack accepts the change.
 
 Message payloads keep canonical user IDs. Pass `--resolve-users` to add display metadata under `referenced_users`, or `--refresh-users` to refresh the 24-hour per-workspace cache before resolving.
 

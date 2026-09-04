@@ -1,8 +1,11 @@
 import type { Command } from "commander";
 import type { CliContext } from "./context.ts";
 import {
+  BROWSER_AUTH_CANVAS_EDIT_ERROR,
   BROWSER_AUTH_CANVAS_CHANNEL_ERROR,
+  CANVAS_EDIT_OPERATIONS,
   createCanvasFromMarkdown,
+  editCanvas,
   fetchCanvasMarkdown,
   parseSlackCanvasUrl,
 } from "../slack/canvas.ts";
@@ -15,6 +18,15 @@ type CanvasCreateOptions = {
   markdown?: string;
   title?: string;
   channel?: string;
+  workspace?: string;
+};
+
+type CanvasEditOptions = {
+  file?: string;
+  markdown?: string;
+  operation: string;
+  sectionId?: string;
+  title?: string;
   workspace?: string;
 };
 
@@ -44,6 +56,27 @@ export async function readCanvasMarkdownInput(options: {
     throw new Error("Canvas Markdown is empty");
   }
   return markdown;
+}
+
+function resolveCanvasTarget(
+  value: string,
+  workspace?: string,
+): {
+  workspaceUrl?: string;
+  canvasId: string;
+} {
+  try {
+    const ref = parseSlackCanvasUrl(value);
+    return { workspaceUrl: ref.workspace_url, canvasId: ref.canvas_id };
+  } catch {
+    const trimmed = String(value).trim();
+    if (!/^F[A-Z0-9]{8,}$/.test(trimmed)) {
+      throw new Error(
+        `Unsupported canvas input: ${value} (expected Slack canvas URL or id like F...)`,
+      );
+    }
+    return { workspaceUrl: workspace?.trim() || undefined, canvasId: trimmed };
+  }
 }
 
 export function registerCanvasCommand(input: { program: Command; ctx: CliContext }): void {
@@ -117,23 +150,8 @@ export function registerCanvasCommand(input: { program: Command; ctx: CliContext
     .action(async (...args) => {
       const [value, options] = args as [string, { workspace?: string; maxChars: string }];
       try {
-        let workspaceUrl: string | undefined;
-        let canvasId: string;
-
-        try {
-          const ref = parseSlackCanvasUrl(value);
-          workspaceUrl = ref.workspace_url;
-          canvasId = ref.canvas_id;
-        } catch {
-          const trimmed = String(value).trim();
-          if (!/^F[A-Z0-9]{8,}$/.test(trimmed)) {
-            throw new Error(
-              `Unsupported canvas input: ${value} (expected Slack canvas URL or id like F...)`,
-            );
-          }
-          canvasId = trimmed;
-          workspaceUrl = options.workspace?.trim() || undefined;
-        }
+        const target = resolveCanvasTarget(value, options.workspace);
+        const { workspaceUrl } = target;
 
         const payload = await input.ctx.withAutoRefresh({
           workspaceUrl,
@@ -144,8 +162,73 @@ export function registerCanvasCommand(input: { program: Command; ctx: CliContext
             return await fetchCanvasMarkdown(client, {
               auth,
               workspaceUrl: workspace_url ?? workspaceUrl ?? "",
-              canvasId,
+              canvasId: target.canvasId,
               options: { maxChars },
+            });
+          },
+        });
+
+        console.log(JSON.stringify(pruneEmpty(payload), null, 2));
+      } catch (err: unknown) {
+        console.error(input.ctx.errorMessage(err));
+        process.exitCode = 1;
+      }
+    });
+
+  canvasCmd
+    .command("edit")
+    .description("Edit a Slack canvas with one documented operation")
+    .argument("<canvas>", "Slack canvas URL (…/docs/…/F…) or canvas id (F…)")
+    .option("--operation <operation>", `Operation: ${CANVAS_EDIT_OPERATIONS.join(", ")}`, "replace")
+    .option(
+      "--file <path>",
+      "Read Markdown from a local file (required for content operations; mutually exclusive with --markdown)",
+    )
+    .option(
+      "--markdown <text>",
+      "Use a Markdown string (required for content operations; mutually exclusive with --file)",
+    )
+    .option(
+      "--section-id <id>",
+      "Canvas section ID (required for insert_before/after/delete; identifies a replace target)",
+    )
+    .option("--title <title>", "New Markdown canvas title (required only for rename)")
+    .option(
+      "--workspace <url>",
+      "Workspace selector (full URL or unique substring; required if passing a canvas id across multiple workspaces)",
+    )
+    .action(async (...args) => {
+      const [value, options] = args as [string, CanvasEditOptions];
+      try {
+        const target = resolveCanvasTarget(value, options.workspace);
+        const operation = options.operation.trim();
+        if (!(CANVAS_EDIT_OPERATIONS as readonly string[]).includes(operation)) {
+          throw new Error(
+            `Unsupported canvas edit operation "${operation}". Expected one of: ${CANVAS_EDIT_OPERATIONS.join(", ")}`,
+          );
+        }
+        const needsMarkdown = operation !== "delete" && operation !== "rename";
+        let markdown: string | undefined;
+        if (needsMarkdown) {
+          markdown = await readCanvasMarkdownInput(options);
+        } else if (options.file !== undefined || options.markdown !== undefined) {
+          throw new Error(`Canvas edit operation "${operation}" does not accept Markdown content`);
+        }
+        const { workspaceUrl } = target;
+
+        const payload = await input.ctx.withAutoRefresh({
+          workspaceUrl,
+          work: async () => {
+            const { client, auth } = await input.ctx.getClientForWorkspace(workspaceUrl);
+            if (auth.auth_type === "browser") {
+              throw new Error(BROWSER_AUTH_CANVAS_EDIT_ERROR);
+            }
+            return await editCanvas(client, {
+              canvasId: target.canvasId,
+              operation,
+              markdown,
+              title: options.title,
+              sectionId: options.sectionId,
             });
           },
         });

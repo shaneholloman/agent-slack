@@ -89,6 +89,16 @@ describe("agent-facing help contracts", () => {
     expect(optionDescription(create, "--channel")).toContain("browser auth");
   });
 
+  test("canvas editing identifies operations, targeting, and content constraints", () => {
+    const edit = findCommand(buildProgram(), "canvas", "edit");
+
+    expect(edit.description()).toContain("one documented operation");
+    expect(optionDescription(edit, "--operation")).toContain("replace");
+    expect(optionDescription(edit, "--file")).toContain("mutually exclusive");
+    expect(optionDescription(edit, "--section-id")).toContain("required");
+    expect(optionDescription(edit, "--title")).toContain("rename");
+  });
+
   test("channel mark distinguishes URL and non-URL workspace handling", () => {
     const mark = findCommand(buildProgram(), "channel", "mark");
 
